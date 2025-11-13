@@ -1,0 +1,418 @@
+import cv2
+import torch
+import numpy as np
+from collections import deque
+import mediapipe as mp
+from torchvision import transforms
+from pathlib import Path
+import asyncio
+import json
+from datetime import datetime
+import logging
+import base64
+from io import BytesIO
+
+# Eager import scipy to avoid lazy loading issues on Windows
+try:
+    from scipy import signal, fft
+except ImportError:
+    pass
+
+from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+
+from rppg_estimator import rPPGEstimator
+from mhavh_model import MHAVH
+from config import Config
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Heart Attack Detection System API",
+    description="Real-time heart rate monitoring and posture analysis",
+    version="1.0.0"
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class HeartAttackDetectionSystem:
+    """Complete heart attack detection system with WebSocket support"""
+    
+    def __init__(self, model_path=None):
+        logger.info("Initializing Heart Attack Detection System...")
+        
+        # Initialize rPPG estimator
+        self.rppg = rPPGEstimator(fps=Config.RPPG_FPS, 
+                                  window_size=Config.RPPG_WINDOW_SIZE)
+        
+        # Initialize device
+        self.device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {self.device}")
+        
+        # Initialize MHAVH model
+        self.posture_model = MHAVH(num_classes=Config.NUM_CLASSES,
+                                   seq_length=Config.SEQUENCE_LENGTH).to(self.device)
+        
+        # Load trained weights if available
+        if model_path and Path(model_path).exists():
+            try:
+                self.posture_model.load_state_dict(torch.load(model_path, map_location=self.device))
+                logger.info(f"Loaded model from {model_path}")
+            except Exception as e:
+                logger.warning(f"Could not load model: {e}. Using random weights.")
+        else:
+            logger.warning("No trained model loaded. Using random weights.")
+        
+        self.posture_model.eval()
+        
+        # Initialize face detection
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            min_detection_confidence=0.5
+        )
+        
+        # Frame buffer for posture detection
+        self.frame_buffer = deque(maxlen=Config.SEQUENCE_LENGTH)
+        
+        # Transform for posture model
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Alert system
+        self.alert_history = deque(maxlen=10)
+        self.consecutive_alerts = 0
+        
+        # Current status
+        self.current_hr = None
+        self.current_posture = None
+        self.current_alert = None
+        
+        # Video capture
+        self.cap = None
+        self.is_running = False
+        self.frame_count = 0
+        
+    def assess_heart_rate_risk(self, hr):
+        """Assess risk level based on heart rate"""
+        if hr is None:
+            return 'unknown', 0
+        
+        if Config.HR_NORMAL_MIN <= hr <= Config.HR_NORMAL_MAX:
+            return 'normal', 0
+        elif Config.HR_WARNING_MIN <= hr < Config.HR_NORMAL_MIN or \
+             Config.HR_NORMAL_MAX < hr <= Config.HR_WARNING_MAX:
+            return 'warning', 1
+        else:
+            return 'critical', 2
+    
+    def process_posture(self, frames):
+        """Process frame sequence for posture classification"""
+        if len(frames) < Config.SEQUENCE_LENGTH:
+            return None, None
+        
+        try:
+            # Prepare frames
+            processed_frames = []
+            for frame in frames:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_tensor = self.transform(frame_rgb)
+                processed_frames.append(frame_tensor)
+            
+            # Stack and add batch dimension
+            input_tensor = torch.stack(processed_frames).unsqueeze(0).to(self.device)
+            
+            # Inference
+            with torch.no_grad():
+                output, _ = self.posture_model(input_tensor)
+                probabilities = torch.softmax(output, dim=1)
+                predicted_class = torch.argmax(probabilities, dim=1).item()
+                confidence = probabilities[0][predicted_class].item()
+            
+            return predicted_class, confidence
+        except Exception as e:
+            logger.error(f"Error processing posture: {e}")
+            return None, None
+    
+    def generate_alert(self, hr, hr_risk, posture_class, posture_conf):
+        """Generate alert based on combined risk assessment"""
+        alert_level = 'none'
+        alert_message = ''
+        
+        # Critical posture detected
+        if posture_class in [2, 3] and posture_conf > 0.7:
+            alert_level = 'critical'
+            alert_message = f"CRITICAL: {Config.CLASS_NAMES[posture_class].upper().replace('_', ' ')} DETECTED!"
+            self.consecutive_alerts += 1
+        
+        # Abnormal heart rate with warning posture
+        elif hr_risk == 'critical' or (hr_risk == 'warning' and posture_class == 1):
+            alert_level = 'warning'
+            if posture_class is not None:
+                alert_message = f"WARNING: Abnormal HR ({hr:.1f} BPM) + {Config.CLASS_NAMES[posture_class]}"
+            else:
+                alert_message = f"WARNING: Abnormal HR ({hr:.1f} BPM)"
+            self.consecutive_alerts += 1
+        
+        # Normal conditions
+        else:
+            self.consecutive_alerts = max(0, self.consecutive_alerts - 1)
+        
+        # Trigger emergency if consecutive alerts
+        if self.consecutive_alerts >= Config.CONSECUTIVE_ALERT_THRESHOLD:
+            alert_level = 'emergency'
+            alert_message = "🚨 EMERGENCY: CALL FOR MEDICAL ASSISTANCE!"
+        
+        self.alert_history.append({
+            'level': alert_level,
+            'message': alert_message,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        return alert_level, alert_message
+    
+    def encode_frame_to_base64(self, frame):
+        """Encode frame to base64 for transmission"""
+        try:
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            return base64.b64encode(buffer).decode('utf-8')
+        except Exception as e:
+            logger.error(f"Error encoding frame: {e}")
+            return None
+    
+    def process_frame(self, frame):
+        """Process a single frame"""
+        hr = None
+        hr_risk = 'unknown'
+        posture_class = None
+        posture_conf = 0
+        face_detected = False
+        
+        # Detect face
+        results = self.face_detection.process(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        if results.detections:
+            face_detected = True
+            # Extract face ROI for rPPG
+            detection = results.detections[0]
+            bboxC = detection.location_data.relative_bounding_box
+            ih, iw, _ = frame.shape
+            x = int(bboxC.xmin * iw)
+            y = int(bboxC.ymin * ih)
+            w = int(bboxC.width * iw)
+            h = int(bboxC.height * ih)
+            
+            # Extract face ROI
+            face_roi = frame[max(0, y):y+h, max(0, x):x+w]
+            
+            if face_roi.size > 0:
+                # Estimate heart rate
+                hr = self.rppg.process_frame(face_roi)
+                if hr:
+                    hr_risk, _ = self.assess_heart_rate_risk(hr)
+        
+        # Add frame to buffer for posture detection
+        self.frame_buffer.append(frame)
+        
+        # Process posture every SEQUENCE_LENGTH frames
+        if len(self.frame_buffer) == Config.SEQUENCE_LENGTH:
+            posture_class, posture_conf = self.process_posture(
+                list(self.frame_buffer))
+        
+        # Generate alert
+        alert_level, alert_message = self.generate_alert(
+            hr, hr_risk, posture_class, posture_conf)
+        
+        # Update current status
+        self.current_hr = hr
+        self.current_posture = {
+            'class': posture_class,
+            'name': Config.CLASS_NAMES[posture_class] if posture_class is not None else 'unknown',
+            'confidence': posture_conf
+        }
+        self.current_alert = {
+            'level': alert_level,
+            'message': alert_message,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.frame_count += 1
+        
+        return {
+            'heart_rate': hr,
+            'hr_risk': hr_risk,
+            'posture': self.current_posture,
+            'alert': self.current_alert,
+            'face_detected': face_detected,
+            'frame_count': self.frame_count
+        }
+    
+    async def stream_from_camera(self, websocket: WebSocket):
+        """Stream real-time data from camera"""
+        cap = cv2.VideoCapture(Config.CAMERA_INDEX)
+        
+        if not cap.isOpened():
+            logger.error(f"Could not open camera {Config.CAMERA_INDEX}")
+            await websocket.send_json({'error': 'Could not open camera'})
+            return
+        
+        # Set camera properties
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        logger.info("Camera stream started")
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning("Failed to read frame from camera")
+                    break
+                
+                # Resize for processing
+                frame = cv2.resize(frame, (Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
+                
+                # Process frame
+                result = self.process_frame(frame)
+                
+                # Encode frame to base64
+                frame_b64 = self.encode_frame_to_base64(frame)
+                
+                # Send data through WebSocket
+                await websocket.send_json({
+                    'type': 'frame',
+                    'frame': frame_b64,
+                    'heart_rate': result['heart_rate'],
+                    'hr_risk': result['hr_risk'],
+                    'posture': result['posture'],
+                    'alert': result['alert'],
+                    'face_detected': result['face_detected'],
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+                # Small delay to avoid overwhelming
+                await asyncio.sleep(0.03)  # ~33 FPS
+                
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+        finally:
+            cap.release()
+            logger.info("Camera stream stopped")
+
+
+# Initialize detection system
+model_path = Config.MODEL_DIR / "mhavh_posture_model.pth"
+detection_system = HeartAttackDetectionSystem(model_path=str(model_path))
+
+
+# ============= API Endpoints =============
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "device": str(detection_system.device),
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get current system status"""
+    return {
+        "heart_rate": detection_system.current_hr,
+        "posture": detection_system.current_posture,
+        "alert": detection_system.current_alert,
+        "frame_count": detection_system.frame_count,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/alerts")
+async def get_alerts(limit: int = 10):
+    """Get recent alerts"""
+    alerts = list(detection_system.alert_history)[-limit:]
+    return {
+        "alerts": alerts,
+        "count": len(alerts),
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.post("/api/reset")
+async def reset_system():
+    """Reset the detection system"""
+    detection_system.rppg.reset()
+    detection_system.frame_buffer.clear()
+    detection_system.consecutive_alerts = 0
+    return {
+        "status": "reset",
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket):
+    """WebSocket endpoint for real-time video and sensor streaming"""
+    await websocket.accept()
+    logger.info("WebSocket client connected")
+    
+    try:
+        await detection_system.stream_from_camera(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        await websocket.close()
+        logger.info("WebSocket client disconnected")
+
+
+# ============= Root Endpoint =============
+
+@app.get("/")
+async def root():
+    """Root endpoint with API documentation"""
+    return {
+        "message": "Heart Attack Detection System API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "GET /api/health",
+            "status": "GET /api/status",
+            "alerts": "GET /api/alerts",
+            "reset": "POST /api/reset",
+            "stream": "WS /ws/stream"
+        },
+        "docs": "/docs"
+    }
+
+
+# ============= Server Runner =============
+
+if __name__ == "__main__":
+    logger.info("Starting Heart Attack Detection System Server...")
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=Config.API_PORT,
+        log_level="info"
+    )
