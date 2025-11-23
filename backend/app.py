@@ -25,6 +25,7 @@ import uvicorn
 
 from rppg_estimator import rPPGEstimator
 from mhavh_model import MHAVH
+from mesh_detector import MeshDetector
 from config import Config
 
 # Configure logging
@@ -57,6 +58,9 @@ class HeartAttackDetectionSystem:
         # Initialize rPPG estimator
         self.rppg = rPPGEstimator(fps=Config.RPPG_FPS, 
                                   window_size=Config.RPPG_WINDOW_SIZE)
+        
+        # Initialize mesh detector
+        self.mesh_detector = MeshDetector(max_history=15, fps=30)
         
         # Initialize device
         self.device = torch.device(Config.DEVICE if torch.cuda.is_available() else 'cpu')
@@ -104,6 +108,7 @@ class HeartAttackDetectionSystem:
         self.current_hr = None
         self.current_posture = None
         self.current_alert = None
+        self.current_mesh = None
         
         # Video capture
         self.cap = None
@@ -151,13 +156,25 @@ class HeartAttackDetectionSystem:
             logger.error(f"Error processing posture: {e}")
             return None, None
     
-    def generate_alert(self, hr, hr_risk, posture_class, posture_conf):
+    def generate_alert(self, hr, hr_risk, posture_class, posture_conf, mesh_status=None):
         """Generate alert based on combined risk assessment"""
         alert_level = 'none'
         alert_message = ''
         
+        # Critical mesh status (facial strain)
+        if mesh_status and mesh_status.get('is_final_alert'):
+            alert_level = 'critical'
+            alert_message = f"🚨 CRITICAL FACIAL STRAIN DETECTED! Status: {mesh_status.get('status', 'Unknown')}"
+            self.consecutive_alerts += 1
+        
+        # Danger mesh status
+        elif mesh_status and mesh_status.get('is_danger'):
+            alert_level = 'warning'
+            alert_message = f"⚠️ DANGER DETECTED! {mesh_status.get('status', 'Unknown')}"
+            self.consecutive_alerts += 1
+        
         # Critical posture detected
-        if posture_class in [2, 3] and posture_conf > 0.7:
+        elif posture_class in [2, 3] and posture_conf > 0.7:
             alert_level = 'critical'
             alert_message = f"CRITICAL: {Config.CLASS_NAMES[posture_class].upper().replace('_', ' ')} DETECTED!"
             self.consecutive_alerts += 1
@@ -204,8 +221,12 @@ class HeartAttackDetectionSystem:
         posture_class = None
         posture_conf = 0
         face_detected = False
+        mesh_result = None
         
-        # Detect face
+        # Process mesh detection
+        mesh_result = self.mesh_detector.process_frame(frame)
+        
+        # Detect face for heart rate estimation
         results = self.face_detection.process(
             cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         
@@ -237,9 +258,9 @@ class HeartAttackDetectionSystem:
             posture_class, posture_conf = self.process_posture(
                 list(self.frame_buffer))
         
-        # Generate alert
+        # Generate alert with mesh data
         alert_level, alert_message = self.generate_alert(
-            hr, hr_risk, posture_class, posture_conf)
+            hr, hr_risk, posture_class, posture_conf, mesh_result)
         
         # Update current status
         self.current_hr = hr
@@ -253,6 +274,7 @@ class HeartAttackDetectionSystem:
             'message': alert_message,
             'timestamp': datetime.now().isoformat()
         }
+        self.current_mesh = mesh_result
         
         self.frame_count += 1
         
@@ -261,6 +283,7 @@ class HeartAttackDetectionSystem:
             'hr_risk': hr_risk,
             'posture': self.current_posture,
             'alert': self.current_alert,
+            'mesh': mesh_result,
             'face_detected': face_detected,
             'frame_count': self.frame_count
         }
@@ -305,6 +328,17 @@ class HeartAttackDetectionSystem:
                     'hr_risk': result['hr_risk'],
                     'posture': result['posture'],
                     'alert': result['alert'],
+                    'mesh': {
+                        'detected': result['mesh']['mesh_detected'],
+                        'status': result['mesh']['status'],
+                        'current_mesh': result['mesh']['current_mesh'],
+                        'baseline_mesh': result['mesh']['baseline_mesh'],
+                        'difference': result['mesh']['difference'],
+                        'metrics': result['mesh']['metrics'],
+                        'danger_frames': result['mesh']['danger_frames'],
+                        'is_danger': result['mesh']['is_danger'],
+                        'is_final_alert': result['mesh']['is_final_alert']
+                    },
                     'face_detected': result['face_detected'],
                     'timestamp': datetime.now().isoformat()
                 })

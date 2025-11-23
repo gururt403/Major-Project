@@ -6,7 +6,12 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { wsService, type VitalData } from "@/lib/websocket-service"
 
-export default function LiveFeedSection() {
+interface LiveFeedSectionProps {
+  onMonitoringChange?: (isMonitoring: boolean) => void
+  onMeshDataChange?: (meshData: any) => void
+}
+
+export default function LiveFeedSection({ onMonitoringChange, onMeshDataChange }: LiveFeedSectionProps) {
   const [frameData, setFrameData] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [faceDetected, setFaceDetected] = useState(false)
@@ -15,6 +20,7 @@ export default function LiveFeedSection() {
   const [error, setError] = useState<string | null>(null)
   const [isMonitoring, setIsMonitoring] = useState(false)
   const [lastAlertLevel, setLastAlertLevel] = useState<string | null>(null)
+  const [meshData, setMeshData] = useState<any>(null)
   const imageRef = useRef<HTMLImageElement>(null)
 
   useEffect(() => {
@@ -59,6 +65,11 @@ export default function LiveFeedSection() {
                 setPosture(newPosture)
               }
             }
+            // Update mesh data
+            if (data.mesh) {
+              setMeshData(data.mesh)
+              onMeshDataChange?.(data.mesh)
+            }
           })
 
           // Connect to WebSocket
@@ -78,6 +89,8 @@ export default function LiveFeedSection() {
           setFaceDetected(false)
           setHeartRate(null)
           setPosture("Unknown")
+          setMeshData(null)
+          onMeshDataChange?.(null)
         }
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Connection failed"
@@ -111,6 +124,11 @@ export default function LiveFeedSection() {
     }
   }, [isMonitoring])
 
+  // Notify parent about monitoring state change
+  useEffect(() => {
+    onMonitoringChange?.(isMonitoring)
+  }, [isMonitoring, onMonitoringChange])
+
   return (
     <section id="monitoring" className="py-16 md:py-24 bg-background">
       <div className="max-w-6xl mx-auto px-4 md:px-6">
@@ -118,7 +136,7 @@ export default function LiveFeedSection() {
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-3xl md:text-4xl font-bold text-foreground">Live Monitoring Feed</h2>
-              <p className="text-muted-foreground mt-2">Real-time facial and posture tracking</p>
+              <p className="text-muted-foreground mt-2">Real-time facial and posture tracking with mesh analysis</p>
             </div>
             <div className="flex gap-3">
               <Button
@@ -141,6 +159,8 @@ export default function LiveFeedSection() {
                   setHeartRate(null)
                   setPosture("Unknown")
                   setFaceDetected(false)
+                  setMeshData(null)
+                  onMeshDataChange?.(null)
                   // Send stop signal to backend
                   wsService.stop()
                   wsService.disconnect()

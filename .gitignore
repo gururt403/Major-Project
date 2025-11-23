@@ -172,6 +172,7 @@ dvc.lock
 *.mov
 *.MOV
 *.flv
+*.md
 
 # Backup files
 backup/
