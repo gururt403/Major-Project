@@ -21,7 +21,10 @@ export default function LiveFeedSection({ onMonitoringChange, onMeshDataChange }
   const [isMonitoring, setIsMonitoring] = useState(false)
   const [lastAlertLevel, setLastAlertLevel] = useState<string | null>(null)
   const [meshData, setMeshData] = useState<any>(null)
+  const [isFullScreen, setIsFullScreen] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
   const imageRef = useRef<HTMLImageElement>(null)
+  const videoContainerRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     let unsubscribeMessage: (() => void) | null = null
@@ -30,9 +33,11 @@ export default function LiveFeedSection({ onMonitoringChange, onMeshDataChange }
 
     const initializeWebSocket = async () => {
       try {
+        setIsLoading(true)
         // Always subscribe to connection and error events
         unsubscribeConnect = wsService.onConnectionChange((connected) => {
           setIsConnected(connected)
+          setIsLoading(false)
           if (!connected) {
             setError("Disconnected from server. Attempting to reconnect...")
           } else {
@@ -129,6 +134,25 @@ export default function LiveFeedSection({ onMonitoringChange, onMeshDataChange }
     onMonitoringChange?.(isMonitoring)
   }, [isMonitoring, onMonitoringChange])
 
+  // Full screen toggle
+  const toggleFullScreen = () => {
+    if (!document.fullscreenElement && videoContainerRef.current) {
+      videoContainerRef.current.requestFullscreen()
+      setIsFullScreen(true)
+    } else if (document.exitFullscreen) {
+      document.exitFullscreen()
+      setIsFullScreen(false)
+    }
+  }
+
+  useEffect(() => {
+    const handleFullScreenChange = () => {
+      setIsFullScreen(!!document.fullscreenElement)
+    }
+    document.addEventListener('fullscreenchange', handleFullScreenChange)
+    return () => document.removeEventListener('fullscreenchange', handleFullScreenChange)
+  }, [])
+
   return (
     <section id="monitoring" className="py-16 md:py-24 bg-background">
       <div className="max-w-6xl mx-auto px-4 md:px-6">
@@ -185,24 +209,51 @@ export default function LiveFeedSection({ onMonitoringChange, onMeshDataChange }
               <CardHeader>
                 <div className="flex items-center justify-between">
                   <CardTitle className="text-lg">Face Detection</CardTitle>
-                  <Badge className={`${
-                    faceDetected
-                      ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
-                      : "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800"
-                  }`}>
-                    {faceDetected ? "Face Detected" : "No Face"}
-                  </Badge>
+                  <div className="flex items-center gap-2">
+                    <Badge className={`${
+                      faceDetected
+                        ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
+                        : "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800"
+                    }`}>
+                      {faceDetected ? "Face Detected" : "No Face"}
+                    </Badge>
+                    {frameData && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={toggleFullScreen}
+                        className="h-7 px-2"
+                      >
+                        {isFullScreen ? "⛶" : "⛶"}
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </CardHeader>
               <CardContent>
-                <div className="aspect-square bg-muted rounded-lg flex items-center justify-center relative overflow-hidden">
+                <div ref={videoContainerRef} className="aspect-square bg-muted rounded-lg flex items-center justify-center relative overflow-hidden">
+                  {isLoading && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/50 z-10">
+                      <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin"></div>
+                      <p className="text-white text-sm mt-4">Connecting...</p>
+                    </div>
+                  )}
                   {frameData ? (
-                    <img
-                      ref={imageRef}
-                      src={frameData}
-                      alt="Live feed"
-                      className="w-full h-full object-cover"
-                    />
+                    <>
+                      <img
+                        ref={imageRef}
+                        src={frameData}
+                        alt="Live feed"
+                        className="w-full h-full object-cover"
+                      />
+                      {!faceDetected && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/30">
+                          <div className="bg-amber-500/90 text-white px-4 py-2 rounded-lg text-sm font-medium">
+                            Position your face in frame
+                          </div>
+                        </div>
+                      )}
+                    </>
                   ) : (
                     <>
                       <svg className="w-full h-full opacity-20" viewBox="0 0 200 200">
@@ -210,26 +261,26 @@ export default function LiveFeedSection({ onMonitoringChange, onMeshDataChange }
                         <ellipse cx="100" cy="140" rx="35" ry="40" fill="currentColor" />
                       </svg>
                       <div className="absolute inset-0 flex items-center justify-center">
-                        <div className={`w-24 h-24 border-2 border-primary rounded-lg ${
-                          isConnected ? "animate-pulse" : ""
-                        }`}></div>
+                        <div className="w-24 h-24 border-2 border-dashed border-primary rounded-lg"></div>
                       </div>
-                      {!isConnected && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                          <span className="text-white text-sm">Connecting...</span>
-                        </div>
-                      )}
                     </>
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground mt-4">
-                  rPPG Heart Rate Detection • {heartRate ? `${heartRate} BPM` : "No data"}
+                  rPPG Heart Rate Detection • {heartRate ? `${heartRate} BPM` : "Analyzing..."}
                 </p>
-                <div className="mt-2 flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${isConnected ? "bg-emerald-500" : "bg-red-500"} animate-pulse`}></div>
-                  <span className="text-xs text-muted-foreground">
-                    {isConnected ? "Connected" : "Disconnected"}
-                  </span>
+                <div className="mt-2 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${isConnected ? "bg-emerald-500" : "bg-red-500"} animate-pulse`}></div>
+                    <span className="text-xs text-muted-foreground">
+                      {isConnected ? "Connected" : "Disconnected"}
+                    </span>
+                  </div>
+                  {frameData && (
+                    <span className="text-xs text-emerald-600 font-medium">
+                      ● LIVE
+                    </span>
+                  )}
                 </div>
               </CardContent>
             </Card>
