@@ -416,23 +416,27 @@ class HeartAttackDetectionSystem:
                 # Always send the last known metrics (cached from processing)
                 if hasattr(self, 'last_result') and self.last_result:
                     data.update({
-                        'heart_rate': self.last_result['heart_rate'],
-                        'hr_risk': self.last_result['hr_risk'],
-                        'posture': self.last_result['posture'],
-                        'alert': self.last_result['alert'],
-                        'mesh': {
-                            'detected': self.last_result['mesh']['mesh_detected'],
-                            'status': self.last_result['mesh']['status'],
-                            'current_mesh': self.last_result['mesh']['current_mesh'],
-                            'baseline_mesh': self.last_result['mesh']['baseline_mesh'],
-                            'difference': self.last_result['mesh']['difference'],
-                            'metrics': self.last_result['mesh']['metrics'],
-                            'danger_frames': self.last_result['mesh']['danger_frames'],
-                            'is_danger': self.last_result['mesh']['is_danger'],
-                            'is_final_alert': self.last_result['mesh']['is_final_alert']
-                        },
-                        'face_detected': self.last_result['face_detected']
+                        'heart_rate': self.last_result.get('heart_rate'),
+                        'hr_risk': self.last_result.get('hr_risk', 'normal'),
+                        'posture': self.last_result.get('posture'),
+                        'alert': self.last_result.get('alert'),
+                        'face_detected': self.last_result.get('face_detected', False)
                     })
+                    
+                    # Add mesh data if available
+                    if self.last_result.get('mesh'):
+                        mesh_data = self.last_result['mesh']
+                        data['mesh'] = {
+                            'detected': mesh_data.get('mesh_detected', False),
+                            'status': mesh_data.get('status', 'unknown'),
+                            'current_mesh': mesh_data.get('current_mesh'),
+                            'baseline_mesh': mesh_data.get('baseline_mesh'),
+                            'difference': mesh_data.get('difference'),
+                            'metrics': mesh_data.get('metrics'),
+                            'danger_frames': mesh_data.get('danger_frames', 0),
+                            'is_danger': mesh_data.get('is_danger', False),
+                            'is_final_alert': mesh_data.get('is_final_alert', False)
+                        }
                 
                 await websocket.send_json(data)
                 
@@ -445,7 +449,7 @@ class HeartAttackDetectionSystem:
             logger.error(f"WebSocket error: {e}")
         finally:
             cap.release()
-            logger.info("Camera stream stopped")
+            logger.info("Camera stream stopped and released")
 
 
 # Initialize detection system with newly trained model
@@ -511,7 +515,10 @@ async def websocket_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
         logger.info("WebSocket client disconnected")
 
 

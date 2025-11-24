@@ -26,44 +26,46 @@ export default function VitalsPanel() {
 
   useEffect(() => {
     const unsubscribe = wsService.onMessage((data: VitalData) => {
-      const newVitals = [...vitals]
+      setVitals(prevVitals => {
+        const newVitals = [...prevVitals]
 
-      // Update Heart Rate with confidence
-      if (data.heart_rate !== null) {
-        const hrRisk = data.hr_risk
-        const prevValue = typeof vitals[0].value === 'number' ? vitals[0].value : 0
-        const currentValue = Math.round(data.heart_rate)
-        const trend = currentValue > prevValue ? 'up' : currentValue < prevValue ? 'down' : 'stable'
-        
-        newVitals[0] = {
-          ...newVitals[0],
-          value: currentValue,
-          status: hrRisk === "normal" ? "healthy" : hrRisk === "warning" ? "warning" : "critical",
-          confidence: 85 + Math.random() * 15,
-          trend,
+        // Update Heart Rate with confidence
+        if (data.heart_rate !== null && data.heart_rate !== undefined) {
+          const hrRisk = data.hr_risk || "normal"
+          const prevValue = typeof prevVitals[0].value === 'number' ? prevVitals[0].value : 0
+          const currentValue = Math.round(data.heart_rate)
+          const trend = currentValue > prevValue ? 'up' : currentValue < prevValue ? 'down' : 'stable'
+          
+          newVitals[0] = {
+            ...newVitals[0],
+            value: currentValue,
+            status: hrRisk === "normal" ? "healthy" : hrRisk === "warning" ? "warning" : "critical",
+            confidence: 85 + Math.random() * 15,
+            trend,
+          }
         }
-      }
 
-      // Update Posture with confidence
-      if (data.posture && data.posture.name) {
-        newVitals[1] = {
-          ...newVitals[1],
-          value: data.posture.name.replace(/_/g, " "),
-          status: data.posture.class === 0 ? "healthy" : "warning",
-          confidence: data.posture.confidence || 75 + Math.random() * 20,
+        // Update Posture with confidence
+        if (data.posture && data.posture.name) {
+          newVitals[1] = {
+            ...newVitals[1],
+            value: data.posture.name.replace(/_/g, " "),
+            status: data.posture.class === 0 ? "healthy" : "warning",
+            confidence: data.posture.confidence || 75 + Math.random() * 20,
+          }
         }
-      }
 
-      // Update Risk Level
-      const riskLevel = data.hr_risk === "critical" ? "critical" : data.hr_risk === "warning" ? "warning" : "healthy"
-      newVitals[2] = {
-        ...newVitals[2],
-        value: riskLevel === "healthy" ? "Low" : riskLevel === "warning" ? "Medium" : "High",
-        status: riskLevel,
-        confidence: 90 + Math.random() * 10,
-      }
+        // Update Risk Level
+        const riskLevel = data.hr_risk === "critical" ? "critical" : data.hr_risk === "warning" ? "warning" : "healthy"
+        newVitals[2] = {
+          ...newVitals[2],
+          value: riskLevel === "healthy" ? "Low" : riskLevel === "warning" ? "Medium" : "High",
+          status: riskLevel,
+          confidence: 90 + Math.random() * 10,
+        }
 
-      setVitals(newVitals)
+        return newVitals
+      })
       
       // Update chart data
       const hrHistory = wsService.getHeartRateHistory()
@@ -88,7 +90,7 @@ export default function VitalsPanel() {
       unsubscribe()
       clearInterval(timerInterval)
     }
-  }, [vitals])
+  }, [])
 
   const getStatusColor = (status: string) => {
     switch (status) {
