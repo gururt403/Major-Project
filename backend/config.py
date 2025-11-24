@@ -20,15 +20,18 @@ class Config:
     UPFALL_DATASET = RAW_DATA_DIR / "posture_datasets" / "UP-Fall"
     
     # Model parameters
-    RPPG_FPS = 15
+    RPPG_FPS = 30  # Increased FPS for better temporal resolution
     RPPG_WINDOW_SIZE = 150  # 5 seconds at 30fps
     
     # MHAVH parameters
-    SEQUENCE_LENGTH = 15
+    SEQUENCE_LENGTH = 20  # Increased for better temporal context
     NUM_CLASSES = 4  # normal, chest_pain, breathing_difficulty, collapse
-    BATCH_SIZE = 8
-    NUM_EPOCHS = 100
-    LEARNING_RATE = 0.001
+    BATCH_SIZE = 16  # Increased batch size for better GPU utilization
+    NUM_EPOCHS = 150  # More epochs for better convergence
+    LEARNING_RATE = 0.0001  # Lower learning rate for fine-tuning
+    WEIGHT_DECAY = 0.0001  # L2 regularization
+    DROPOUT = 0.3  # Dropout rate
+    LABEL_SMOOTHING = 0.1  # Label smoothing for better generalization
     
     # Heart rate thresholds (BPM)
     HR_NORMAL_MIN = 60

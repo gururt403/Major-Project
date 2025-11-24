@@ -49,14 +49,7 @@ class SimplifiedDetectionSystem:
     
     def __init__(self):
         logger.info("Initializing Simplified Detection System...")
-        self.device = torch.device('cpu')
-        logger.info(f"Using device: {self.device}")
-        
-        # Initialize face detection only (light)
-        self.mp_face_detection = mp.solutions.face_detection
-        self.face_detection = self.mp_face_detection.FaceDetection(
-            min_detection_confidence=0.5
-        )
+        logger.info("Running in LIVE FEED mode - No AI processing for maximum performance")
         
         # Alert system
         self.alert_history = deque(maxlen=10)
@@ -138,8 +131,8 @@ class SimplifiedDetectionSystem:
     def encode_frame_to_base64(self, frame):
         """Encode frame to base64 for transmission"""
         try:
-            # Lower quality for faster encoding and transmission (60 instead of 80)
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            # Medium quality for balance between speed and quality (70)
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             return base64.b64encode(buffer).decode('utf-8')
         except Exception as e:
             logger.error(f"Error encoding frame: {e}")
@@ -257,8 +250,8 @@ class SimplifiedDetectionSystem:
                     'timestamp': datetime.now().isoformat()
                 })
                 
-                # Minimal delay for faster streaming (reduce lag)
-                await asyncio.sleep(0.015)  # ~66 FPS instead of 33 FPS
+                # Minimal delay for smooth streaming at 30 FPS
+                await asyncio.sleep(0.033)
                 
         except Exception as e:
             logger.error(f"WebSocket error: {e}")

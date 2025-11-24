@@ -110,10 +110,85 @@ class HeartAttackDetectionSystem:
         self.current_alert = None
         self.current_mesh = None
         
+        # Smoothing buffers for stable predictions
+        self.hr_history = deque(maxlen=10)  # Last 10 heart rate readings
+        self.posture_history = deque(maxlen=5)  # Last 5 posture predictions
+        self.confidence_history = deque(maxlen=5)  # Last 5 confidence scores
+        
+        # Cache for last processed result with initial "analysing" state
+        self.last_result = {
+            'heart_rate': 'Analysing...',
+            'hr_risk': 'Normal',
+            'posture': {
+                'class': 'Analysing...',
+                'confidence': 0,
+                'risk': 'Unknown'
+            },
+            'alert': {
+                'level': 'info',
+                'message': 'Initializing detection system...',
+                'timestamp': datetime.now().isoformat()
+            },
+            'mesh': {
+                'mesh_detected': False,
+                'status': 'Analysing...',
+                'current_mesh': None,
+                'baseline_mesh': None,
+                'difference': None,
+                'metrics': {},
+                'danger_frames': 0,
+                'is_danger': False,
+                'is_final_alert': False
+            },
+            'face_detected': False
+        }
+        
         # Video capture
         self.cap = None
         self.is_running = False
         self.frame_count = 0
+    
+    def smooth_heart_rate(self, new_hr):
+        """Apply exponential moving average to heart rate"""
+        if new_hr is None:
+            return self.current_hr
+        
+        self.hr_history.append(new_hr)
+        
+        # Use weighted average with more weight on recent values
+        if len(self.hr_history) >= 3:
+            weights = np.array([0.1, 0.2, 0.3, 0.4])[-len(self.hr_history):]
+            weights = weights / weights.sum()
+            smoothed_hr = np.average(list(self.hr_history)[-len(weights):], weights=weights)
+            return round(smoothed_hr, 1)
+        
+        return new_hr
+    
+    def smooth_posture(self, new_class, new_confidence):
+        """Apply majority voting to posture predictions"""
+        if new_class is None:
+            return self.current_posture['class'] if self.current_posture else None, \
+                   self.current_posture['confidence'] if self.current_posture else 0
+        
+        self.posture_history.append(new_class)
+        self.confidence_history.append(new_confidence)
+        
+        # Use majority voting if we have enough history
+        if len(self.posture_history) >= 3:
+            # Count occurrences
+            from collections import Counter
+            counts = Counter(self.posture_history)
+            most_common_class = counts.most_common(1)[0][0]
+            
+            # Average confidence for the most common class
+            conf_sum = sum(c for p, c in zip(self.posture_history, self.confidence_history) 
+                          if p == most_common_class)
+            conf_count = sum(1 for p in self.posture_history if p == most_common_class)
+            avg_confidence = conf_sum / conf_count if conf_count > 0 else new_confidence
+            
+            return most_common_class, avg_confidence
+        
+        return new_class, new_confidence
         
     def assess_heart_rate_risk(self, hr):
         """Assess risk level based on heart rate"""
@@ -246,8 +321,10 @@ class HeartAttackDetectionSystem:
             
             if face_roi.size > 0:
                 # Estimate heart rate
-                hr = self.rppg.process_frame(face_roi)
-                if hr:
+                raw_hr = self.rppg.process_frame(face_roi)
+                if raw_hr:
+                    # Apply smoothing to heart rate
+                    hr = self.smooth_heart_rate(raw_hr)
                     hr_risk, _ = self.assess_heart_rate_risk(hr)
         
         # Add frame to buffer for posture detection
@@ -255,19 +332,22 @@ class HeartAttackDetectionSystem:
         
         # Process posture every SEQUENCE_LENGTH frames
         if len(self.frame_buffer) == Config.SEQUENCE_LENGTH:
-            posture_class, posture_conf = self.process_posture(
+            raw_posture_class, raw_posture_conf = self.process_posture(
                 list(self.frame_buffer))
+            
+            # Apply smoothing to posture predictions
+            posture_class, posture_conf = self.smooth_posture(raw_posture_class, raw_posture_conf)
         
-        # Generate alert with mesh data
+        # Generate alert with mesh data (use smoothed values)
         alert_level, alert_message = self.generate_alert(
             hr, hr_risk, posture_class, posture_conf, mesh_result)
         
-        # Update current status
+        # Update current status with smoothed values
         self.current_hr = hr
         self.current_posture = {
             'class': posture_class,
             'name': Config.CLASS_NAMES[posture_class] if posture_class is not None else 'unknown',
-            'confidence': posture_conf
+            'confidence': round(posture_conf, 3) if posture_conf else 0
         }
         self.current_alert = {
             'level': alert_level,
@@ -289,7 +369,7 @@ class HeartAttackDetectionSystem:
         }
     
     async def stream_from_camera(self, websocket: WebSocket):
-        """Stream real-time data from camera"""
+        """Stream real-time data from camera with optimized processing"""
         cap = cv2.VideoCapture(Config.CAMERA_INDEX)
         
         if not cap.isOpened():
@@ -300,9 +380,12 @@ class HeartAttackDetectionSystem:
         # Set camera properties
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FPS, 60)
         
         logger.info("Camera stream started")
+        
+        frame_count = 0
+        process_every_n_frames = 5  # Process metrics every 5 frames (6 FPS analysis)
         
         try:
             while True:
@@ -311,40 +394,52 @@ class HeartAttackDetectionSystem:
                     logger.warning("Failed to read frame from camera")
                     break
                 
-                # Resize for processing
+                # Resize for display
                 frame = cv2.resize(frame, (Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
                 
-                # Process frame
-                result = self.process_frame(frame)
+                # Only process metrics every N frames to reduce lag
+                if frame_count % process_every_n_frames == 0:
+                    result = self.process_frame(frame)
+                    # Update cached results
+                    self.last_result = result
                 
-                # Encode frame to base64
+                # Always encode and send the frame for smooth video
                 frame_b64 = self.encode_frame_to_base64(frame)
                 
-                # Send data through WebSocket
-                await websocket.send_json({
+                # Send data through WebSocket with last known metrics
+                data = {
                     'type': 'frame',
                     'frame': frame_b64,
-                    'heart_rate': result['heart_rate'],
-                    'hr_risk': result['hr_risk'],
-                    'posture': result['posture'],
-                    'alert': result['alert'],
-                    'mesh': {
-                        'detected': result['mesh']['mesh_detected'],
-                        'status': result['mesh']['status'],
-                        'current_mesh': result['mesh']['current_mesh'],
-                        'baseline_mesh': result['mesh']['baseline_mesh'],
-                        'difference': result['mesh']['difference'],
-                        'metrics': result['mesh']['metrics'],
-                        'danger_frames': result['mesh']['danger_frames'],
-                        'is_danger': result['mesh']['is_danger'],
-                        'is_final_alert': result['mesh']['is_final_alert']
-                    },
-                    'face_detected': result['face_detected'],
                     'timestamp': datetime.now().isoformat()
-                })
+                }
                 
-                # Small delay to avoid overwhelming
-                await asyncio.sleep(0.03)  # ~33 FPS
+                # Always send the last known metrics (cached from processing)
+                if hasattr(self, 'last_result') and self.last_result:
+                    data.update({
+                        'heart_rate': self.last_result['heart_rate'],
+                        'hr_risk': self.last_result['hr_risk'],
+                        'posture': self.last_result['posture'],
+                        'alert': self.last_result['alert'],
+                        'mesh': {
+                            'detected': self.last_result['mesh']['mesh_detected'],
+                            'status': self.last_result['mesh']['status'],
+                            'current_mesh': self.last_result['mesh']['current_mesh'],
+                            'baseline_mesh': self.last_result['mesh']['baseline_mesh'],
+                            'difference': self.last_result['mesh']['difference'],
+                            'metrics': self.last_result['mesh']['metrics'],
+                            'danger_frames': self.last_result['mesh']['danger_frames'],
+                            'is_danger': self.last_result['mesh']['is_danger'],
+                            'is_final_alert': self.last_result['mesh']['is_final_alert']
+                        },
+                        'face_detected': self.last_result['face_detected']
+                    })
+                
+                await websocket.send_json(data)
+                
+                frame_count += 1
+                
+                # Minimal delay for smooth 30 FPS video
+                await asyncio.sleep(0.01)  # ~100 FPS max, limited by camera
                 
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
@@ -353,8 +448,8 @@ class HeartAttackDetectionSystem:
             logger.info("Camera stream stopped")
 
 
-# Initialize detection system
-model_path = Config.MODEL_DIR / "mhavh_posture_model.pth"
+# Initialize detection system with newly trained model
+model_path = Path("models/trained_weights/training_20251124_215016/best_model.pth")
 detection_system = HeartAttackDetectionSystem(model_path=str(model_path))
 
 

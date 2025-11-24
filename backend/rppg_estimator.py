@@ -34,7 +34,7 @@ class rPPGEstimator:
         
     def extract_rgb_signals(self, face_roi):
         """
-        Extract mean RGB values from facial region of interest
+        Extract mean RGB values from facial region of interest with improved ROI selection
         
         Args:
             face_roi (np.ndarray): Cropped face region (BGR format)
@@ -50,18 +50,29 @@ class rPPGEstimator:
         if h < 10 or w < 10:
             return None
         
-        # Focus on forehead region (best for rPPG - less motion, good blood flow)
-        forehead = face_roi[int(h*0.2):int(h*0.4), int(w*0.3):int(w*0.7)]
+        # Use multiple ROIs for robust signal extraction
+        # Forehead region (best for rPPG)
+        forehead = face_roi[int(h*0.15):int(h*0.35), int(w*0.25):int(w*0.75)]
         
-        if forehead.size == 0:
+        # Cheek regions (additional signal sources)
+        left_cheek = face_roi[int(h*0.4):int(h*0.65), int(w*0.1):int(w*0.35)]
+        right_cheek = face_roi[int(h*0.4):int(h*0.65), int(w*0.65):int(w*0.9)]
+        
+        rgb_signals = []
+        
+        for roi in [forehead, left_cheek, right_cheek]:
+            if roi.size > 0:
+                # Use median instead of mean for robustness to outliers
+                r = np.median(roi[:, :, 2])
+                g = np.median(roi[:, :, 1])
+                b = np.median(roi[:, :, 0])
+                rgb_signals.append([r, g, b])
+        
+        if len(rgb_signals) == 0:
             return None
         
-        # Calculate mean RGB values
-        r = np.mean(forehead[:, :, 2])
-        g = np.mean(forehead[:, :, 1])
-        b = np.mean(forehead[:, :, 0])
-        
-        return np.array([r, g, b])
+        # Average signals from multiple ROIs
+        return np.mean(rgb_signals, axis=0)
     
     def chrom_method(self, rgb_signals):
         """
@@ -168,7 +179,7 @@ class rPPGEstimator:
     
     def estimate_heart_rate(self, pulse_signal):
         """
-        Estimate heart rate using Fast Fourier Transform (FFT)
+        Estimate heart rate using enhanced FFT with Welch's method for better frequency resolution
         
         Args:
             pulse_signal (np.ndarray): Extracted pulse signal
@@ -179,35 +190,76 @@ class rPPGEstimator:
         if len(pulse_signal) < 20:
             return None
             
-        # Remove DC component (mean)
+        # Remove DC component and detrend
         pulse_signal = pulse_signal - np.mean(pulse_signal)
+        pulse_signal = signal.detrend(pulse_signal)
         
-        # Apply FFT
-        n = len(pulse_signal)
-        fft_values = fft(pulse_signal)
-        fft_freqs = fftfreq(n, 1.0/self.fps)
+        # Apply Hamming window to reduce spectral leakage
+        window = np.hamming(len(pulse_signal))
+        pulse_signal = pulse_signal * window
         
-        # Only consider positive frequencies
-        pos_mask = fft_freqs > 0
-        fft_values = np.abs(fft_values[pos_mask])
-        fft_freqs = fft_freqs[pos_mask]
-        
-        # Filter to physiological heart rate range: 42-180 BPM (0.7-3 Hz)
-        hr_mask = (fft_freqs >= 0.7) & (fft_freqs <= 3.0)
-        hr_freqs = fft_freqs[hr_mask]
-        hr_fft = fft_values[hr_mask]
-        
-        if len(hr_fft) == 0:
-            return None
-        
-        # Find peak frequency (dominant heart rate)
-        peak_idx = np.argmax(hr_fft)
-        peak_freq = hr_freqs[peak_idx]
-        
-        # Convert frequency (Hz) to BPM
-        heart_rate = peak_freq * 60.0
-        
-        return heart_rate
+        # Use Welch's method for better spectral estimation
+        try:
+            freqs, psd = signal.welch(
+                pulse_signal,
+                fs=self.fps,
+                nperseg=min(len(pulse_signal), 256),
+                noverlap=min(len(pulse_signal)//2, 128),
+                window='hamming'
+            )
+            
+            # Filter to physiological heart rate range: 40-200 BPM (0.67-3.33 Hz)
+            hr_mask = (freqs >= 0.67) & (freqs <= 3.33)
+            hr_freqs = freqs[hr_mask]
+            hr_psd = psd[hr_mask]
+            
+            if len(hr_psd) == 0:
+                return None
+            
+            # Find peak frequency with quadratic interpolation for sub-bin accuracy
+            peak_idx = np.argmax(hr_psd)
+            
+            # Parabolic interpolation for better accuracy
+            if 0 < peak_idx < len(hr_psd) - 1:
+                alpha = hr_psd[peak_idx - 1]
+                beta = hr_psd[peak_idx]
+                gamma = hr_psd[peak_idx + 1]
+                p = 0.5 * (alpha - gamma) / (alpha - 2 * beta + gamma)
+                peak_freq = hr_freqs[peak_idx] + p * (hr_freqs[1] - hr_freqs[0])
+            else:
+                peak_freq = hr_freqs[peak_idx]
+            
+            # Convert frequency (Hz) to BPM
+            heart_rate = peak_freq * 60.0
+            
+            # Additional validation: check if peak is prominent
+            if hr_psd[peak_idx] < 2 * np.mean(hr_psd):
+                return None
+            
+            return heart_rate
+            
+        except Exception as e:
+            # Fallback to simple FFT if Welch's method fails
+            n = len(pulse_signal)
+            fft_values = fft(pulse_signal)
+            fft_freqs = fftfreq(n, 1.0/self.fps)
+            
+            pos_mask = fft_freqs > 0
+            fft_values = np.abs(fft_values[pos_mask])
+            fft_freqs = fft_freqs[pos_mask]
+            
+            hr_mask = (fft_freqs >= 0.67) & (fft_freqs <= 3.33)
+            hr_freqs = fft_freqs[hr_mask]
+            hr_fft = fft_values[hr_mask]
+            
+            if len(hr_fft) == 0:
+                return None
+            
+            peak_idx = np.argmax(hr_fft)
+            peak_freq = hr_freqs[peak_idx]
+            heart_rate = peak_freq * 60.0
+            
+            return heart_rate
     
     def process_frame(self, face_roi):
         """
